@@ -2539,6 +2539,7 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
             future_map=self.future_map,
+            gr_paged_enabled=get_exec().kernel.attention_backend == "gr_paged",
         )
 
     def init_batch_result_processor(self) -> None:
@@ -2903,6 +2904,14 @@ class Scheduler(
                     recv_req.session_id
                 )
 
+            if get_exec().kernel.attention_backend == "gr_paged" and not is_beam:
+                prepare_abort(
+                    req,
+                    "gr_paged requires a GR beam-search request (beam_width > 1).",
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+                self.output_streamer.stream_output([req], req.return_logprob)
+                return
             if is_beam:
                 error_msg = self.beam_coordinator.validate_and_init(req, recv_req)
                 if error_msg:
@@ -4093,8 +4102,9 @@ class Scheduler(
                     running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 
@@ -4214,7 +4224,24 @@ class Scheduler(
                 self.tree_cache.ready_to_load_host_cache()
             )
 
-        new_batch.prepare_for_extend()
+        try:
+            new_batch.prepare_for_extend()
+        except MemoryError as exc:
+            if not all(
+                r.beam_group is not None and r.beam_group.gr_paged_kv is not None
+                for r in can_run_list
+            ):
+                raise
+            for req in can_run_list:
+                req.to_finish = FINISH_ABORT(
+                    str(exc), status_code=HTTPStatus.SERVICE_UNAVAILABLE
+                )
+                self.beam_coordinator._abort_group(req.beam_group)
+                if req.kv.holds_kv:
+                    release_kv_cache(req, self.tree_cache, checkpoint=False)
+                self._release_aborted_request(req)
+                self.output_streamer.stream_output([req], req.return_logprob)
+            return None, running_batch
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -5651,6 +5678,18 @@ class Scheduler(
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
             self.decode_offload_manager.drain_before_retraction()
+        # Compact GR cannot resume through ordinary row re-prefill. Drain and
+        # abort it before administrative retraction/weight replacement.
+        for req in dict.fromkeys(retract_reqs):
+            if req.beam_group is not None and req.beam_group.gr_paged_kv is not None:
+                req.to_finish = FINISH_ABORT(
+                    "Paged GR request aborted by administrative retraction."
+                )
+                self.beam_coordinator._abort_group(req.beam_group)
+                release_kv_cache(req, self.tree_cache, checkpoint=False)
+                self._release_aborted_request(req)
+                self.output_streamer.stream_output([req], req.return_logprob)
+        retract_reqs = [r for r in retract_reqs if not r.finished()]
         if retract_reqs:
             # Decode-side retract always rebootstraps (recomputes the KV from
             # the prefill), so skip the device->host KV offload that release_req

@@ -678,7 +678,9 @@ class PrefillAdder:
         # fail-loud `RuntimeError`. `None` outside the unified Mamba pool.
         self.rem_mamba_slots = None
         if self._mamba_slot_cost:
-            self.rem_mamba_slots = self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
+            self.rem_mamba_slots = (
+                self.token_to_kv_pool_allocator.mamba_allocator.schedulable_available_size()
+            )
             if self.is_hybrid_ssm_cache:
                 self.rem_mamba_slots += self.tree_cache.mamba_evictable_size()
 
@@ -1299,12 +1301,35 @@ class PrefillAdder:
 
         return self.budget_state()
 
+    def _add_gr_paged_req(self, req: Req):
+        """Admit one group with its complete generated-KV budget."""
+        if self.can_run_list or (
+            self.running_batch is not None
+            and any(not r.finished() for r in self.running_batch.reqs)
+        ):
+            return AddReqResult.OTHER
+        state = req.beam_group.gr_paged_kv
+        extend_len = len(req.full_untruncated_fill_ids) - req.prefix_len
+        needed = self.ceil_paged_tokens(extend_len) + state.arena_slots
+        with self._lock_node(req.last_node):
+            if needed > self.rem_total_tokens:
+                return AddReqResult.NO_TOKEN
+            if extend_len > self.rem_input_tokens:
+                return AddReqResult.OTHER
+            admission = _PrefillAdmission(
+                req.prefix_len, extend_len, state.arena_slots, False
+            )
+            self._commit_prefill_admission(req, admission, mamba_gap_reserve=0)
+        return AddReqResult.OTHER
+
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]
     ):
         if (x := self.prefill_max_requests) is not None and len(self.can_run_list) >= x:
             return AddReqResult.OTHER
 
+        if req.beam_group is not None and req.beam_group.gr_paged_kv is not None:
+            return self._add_gr_paged_req(req)
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
             return self.add_one_req_ignore_eos(req)
 
@@ -1503,9 +1528,9 @@ class PrefillAdder:
         max_new_tokens = min(req.sampling_params.max_new_tokens, CLIP_MAX_NEW_TOKENS)
         tile_tokens = input_tokens
         if self.dllm_config is not None:
-            assert truncation_align_size is None, (
-                "truncation_align_size is not supported for dllm prefill"
-            )
+            assert (
+                truncation_align_size is None
+            ), "truncation_align_size is not supported for dllm prefill"
             extend_len = self._get_dllm_extend_len(req, prefix_len)
             if extend_len <= 0:
                 return AddReqResult.OTHER
